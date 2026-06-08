@@ -1,7 +1,7 @@
 # 6.5840 / MIT 分布式系统实验笔记
 
 本仓库为 [MIT 6.5840 (Spring 2026)](https://pdos.csail.mit.edu/6.5840/) 课程实验的本地实现与复习文档。  
-当前已完成 **Lab 1（MapReduce）** 与 **Lab 2（单机 KV Server + Lock）** 的主体实现；后续 Lab（Raft、KV Raft、Shard KV 等）目录已存在，尚未在本文档中展开。
+当前已完成 **Lab 1（MapReduce）**、**Lab 2（单机 KV Server + Lock）**，以及 **Lab 3 的 Raft 3A（选举 + 心跳）与 3B（日志复制 + 提交）**；3C（持久化）及后续 Lab 4/5 待完成。
 
 ---
 
@@ -12,9 +12,10 @@
 3. [如何编译与测试](#如何编译与测试)
 4. [Lab 1：MapReduce](#lab-1mapreduce)
 5. [Lab 2：单机 KV Server](#lab-2单机-kv-server)
-6. [概念对照表](#概念对照表)
-7. [常见坑与调试](#常见坑与调试)
-8. [后续 Lab 预告](#后续-lab-预告)
+6. [Lab 3：Raft（3A + 3B）](#lab-3raft3a--3b)
+7. [概念对照表](#概念对照表)
+8. [常见坑与调试](#常见坑与调试)
+9. [后续 Lab 预告](#后续-lab-预告)
 
 ---
 
@@ -26,7 +27,7 @@
 ├── README.md             # 本文档
 └── src/
     ├── go.mod            # module 6.5840
-    ├── Makefile          # 日常测试：make mr / make kvsrv1 / make lock1
+    ├── Makefile          # 日常测试：make mr / make kvsrv1 / make lock1 / make raft1
     ├── mr/               # ★ Lab 1：Coordinator + Worker
     ├── mrapps/           # MapReduce 插件（wc、indexer 等，课程提供）
     ├── main/             # 各 lab 的 main / daemon 入口
@@ -38,8 +39,12 @@
     ├── kvtest1/          # KV 测试框架（Porcupine 线性化检查等）
     ├── labrpc/           # 模拟不可靠网络的 RPC（channel + labgob）
     ├── tester1/          # 测试 harness（多进程 daemon、UNIX socket）
-    ├── kvraft1/          # Lab 3+（未实现）
-    ├── raft1/
+    ├── raft1/            # ★ Lab 3：Raft（raft.go 实现 3A/3B）
+    │   ├── raft.go       # 核心：选举、复制、提交
+    │   ├── server.go     # applyCh 消费者，对接 tester
+    │   └── raft_test.go  # 3A/3B 测试
+    ├── raftapi/          # Raft 对上层的接口（Start / GetState / ApplyMsg）
+    ├── kvraft1/          # Lab 4（未实现）
     └── shardkv1/
 ```
 
@@ -84,6 +89,11 @@ make RUN="-run Unreliable" kvsrv1
 # Lab 2：基于 KV 的锁
 make lock1
 make RUN="-run Unreliable" lock1
+
+# Lab 3：Raft（建议带 -race，Makefile 默认已启用）
+make RUN="-run 3A" raft1
+make RUN="-run 3B" raft1
+make RUN="-run TestBasicAgree3B" raft1
 ```
 
 **注意：** `make lock1` 必须在 `src/` 下运行；在 `src/kvsrv1` 内直接 `make lock1` 会找不到 Makefile 目标。
@@ -400,17 +410,271 @@ flowchart TD
 
 ---
 
+## Lab 3：Raft（3A + 3B）
+
+实现论文 [*In Search of an Understandable Consensus Algorithm (Extended Version)*](https://raft.github.io/raft.pdf) Figure 2 中的 **Leader 选举** 与 **日志复制**。核心代码在 `src/raft1/raft.go`。
+
+### 3.0 目标与分层
+
+| Part | 目标 | 测试 |
+|------|------|------|
+| **3A** | 选举唯一 Leader；心跳压制抢选；Leader 失效后重选 | `make RUN="-run 3A" raft1` |
+| **3B** | Leader 接收命令、复制 log、多数派提交；各副本经 `applyCh` 上报 | `make RUN="-run 3B" raft1` |
+| 3C（未做） | `persist()` / 崩溃恢复 | — |
+
+**与 Lab 2 的关系：** Lab 2 是单副本 KV；Raft 把「复制 + 共识」从应用里拆出来。Lab 4 会用 Raft 复制 Lab 2 风格的 KV，`Start(command)` 相当于 client 写 log，`applyCh` 相当于「已提交命令交给状态机执行」。
+
+```mermaid
+flowchart TB
+  subgraph Upper["上层（tester / 未来 KV）"]
+    ST[Start command]
+    AP[server.applier 读 applyCh]
+  end
+
+  subgraph Raft["raft.go 每个 peer"]
+    T[ticker goroutine]
+    EL[startElection]
+    HB[startHeartBeat]
+    RV[RequestVote handler]
+    AE[AppendEntries handler]
+    APG[applier goroutine]
+    SM["状态: term / role / log / commitIndex"]
+  end
+
+  subgraph Net["labrpc"]
+    RPC[Call / handler]
+  end
+
+  ST -->|仅 leader| SM
+  T -->|超时| EL
+  T -->|leader 周期| HB
+  EL --> RPC
+  HB --> RPC
+  RPC --> RV
+  RPC --> AE
+  RV --> SM
+  AE --> SM
+  SM --> APG
+  APG -->|ApplyMsg| AP
+```
+
+**进程与内存：** 每个 peer 是独立 goroutine 集合，共享状态在 `Raft` 结构体堆上，用 `sync.Mutex` 保护。`labrpc.Call()` 在客户端 goroutine 阻塞，对端在 **另一 goroutine** 执行 handler——与 Lab 2 相同，不能持锁做 RPC（否则 handler 拿不到锁会死锁）。
+
+---
+
+### 3.1 核心状态（`Raft` struct）
+
+对照 Figure 2，本实现字段如下：
+
+| 类别 | 字段 | 含义 |
+|------|------|------|
+| 持久化（3C 待做） | `currentTerm`, `votedFor`, `log` | 任期、本 term 投给谁、日志 |
+| 易失 | `commitIndex`, `lastApplied`, `currentState` | 已提交 / 已 apply 下标、Follower/Candidate/Leader |
+| Leader 专用 | `nextIndex[]`, `matchIndex[]` | 对每个 peer：下一条要发的 index；已确认复制的最大 index |
+| 选举计时 | `lastRPC`, `r` | 上次收到合法 RPC 的时间；每 peer 独立随机种子 |
+| 心跳节流 | `lastHeartBeat` | Leader 上次批量发 AppendEntries 的时间（≥100ms 间隔） |
+| 与上层通信 | `applyCh` | 提交后发送 `ApplyMsg` |
+
+**Log 下标约定（课程建议）：**
+
+- 底层 slice **0-index**，`log[0] = {Term:0}` 为 **dummy 哨兵**（无业务命令）。
+- 第一条真实命令在 **index = 1**；`Start()` 返回的 index 即 `len(log)-1`。
+- `nextIndex[i]` 初始为 **1**（下一条要复制的是 index 1）；`PrevLogIndex = nextIndex - 1`，首次复制时 `PrevLogIndex=0, PrevLogTerm=0`。
+
+```go
+type LogEntry struct {
+    Term    int64
+    Command interface{}  // Raft 不解析内容，Lab 4 才是 Put/Get
+}
+```
+
+---
+
+### 3.2 后台 Goroutine 分工
+
+| Goroutine | 入口 | 职责 |
+|-----------|------|------|
+| `ticker()` | `Make()` | 短 sleep 后轮询：非 leader 检查选举超时；leader 节流发心跳 |
+| `applier()` | `Make()` | `lastApplied < commitIndex` 时递增并写 `applyCh` |
+| `startElection()` | ticker 超时 / candidate 再超时 | term++、拉票、过半变 leader |
+| `startHeartBeat()` | ticker / `Start()` / 刚当选 | 并行 AppendEntries（复制或空心跳） |
+| RPC handler | labrpc 回调 | `RequestVote` / `AppendEntries` 改本地状态 |
+
+**选举超时模型（不用 `time.Timer`）：**
+
+- **不是**「每次 sleep 300ms 就选举」。
+- 而是：`lastRPC` 记录上次收到合法 RPC 的时刻；ticker 里 `time.Since(lastRPC) >= randomTimeout()` 才触发选举。
+- 收到 AppendEntries（合法 term）或 Grant RequestVote 时更新 `lastRPC`，相当于重置计时器。
+
+参数：`MinElectionTimeout=150ms`，`MaxElectionTimeout=300ms`（每 peer 随机，减少 split vote）；Leader 心跳间隔 **>100ms**（测试要求 ≤10 次/秒）。
+
+---
+
+### 3.3 Part 3A：选举 + 心跳
+
+#### 3.3.1 状态机（Follower / Candidate / Leader）
+
+```mermaid
+stateDiagram-v2
+  [*] --> Follower
+  Follower --> Candidate: election timeout
+  Candidate --> Leader: 多数 GrantVote
+  Candidate --> Follower: 发现更高 term
+  Candidate --> Candidate: 再次 timeout, term++ 重选
+  Leader --> Follower: 发现更高 term
+  Follower --> Follower: 收到合法 AppendEntries / GrantVote
+  Leader --> Leader: 周期 AppendEntries
+```
+
+#### 3.3.2 `RequestVote`（Follower 视角 — 被拉票）
+
+决策顺序：
+
+1. `args.Term < currentTerm` → 拒绝  
+2. `args.Term > currentTerm` → 升 term、变 Follower、`votedFor = -1`  
+3. 本 term 已投他人 → 拒绝  
+4. **`isLogUpToDate`**：candidate log 至少一样新 → 否则拒绝（3B 选举限制）  
+5. Grant：`votedFor = CandidateId`，`lastRPC = Now`
+
+**Log 新旧比较（5.4.1）：** 先比 `LastLogTerm`，再比 `LastLogIndex`；**相等时也要投**（`>=`，不是 `>`）。
+
+#### 3.3.3 `startElection()`（Candidate 视角 — 发起拉票）
+
+1. 持锁：`candidate`，`term++`，`votedFor = me`，`lastRPC = Now`  
+2. 快照 `termAtStart`、`LastLogIndex/Term`，`grantedVotes = 1`（投自己）  
+3. **解锁**后对每个 `peer != me` 开 goroutine：`sendRequestVote`  
+4. 收到 reply 后持锁：更高 term → Follower；过期 reply 丢弃；`VoteGranted` → 计票  
+5. 过半 → `leader`，重置 `nextIndex[i]=len(log)`、`matchIndex[i]=0`，**立即** `startHeartBeat()`
+
+**锁契约：** RPC 不持锁；`startElection` / `startHeartBeat` 为「普通函数」，内部自管 `mu`；`ticker` 调用前先 `Unlock`，返回后再 `Lock`。
+
+#### 3.3.4 `AppendEntries` 空包 = 心跳（3A 阶段）
+
+Follower：合法 term → 变 Follower、更新 `lastRPC`（压制抢选）。  
+Leader：`startHeartBeat()` 周期性发送 `Entries=[]` 的 AppendEntries。
+
+---
+
+### 3.4 Part 3B：日志复制 + 提交 + Apply
+
+#### 3.4.1 端到端数据流
+
+```mermaid
+sequenceDiagram
+  participant C as Client/tester
+  participant L as Leader
+  participant F as Follower
+  participant A as applier
+  participant T as tester.CheckLogs
+
+  C->>L: Start(cmd)
+  L->>L: append log[index]={term,cmd}
+  L->>F: AppendEntries(prev, entries)
+  F->>F: 一致性检查 / append / 截断
+  F-->>L: Success
+  L->>L: matchIndex++, TryCommit → commitIndex
+  F->>F: LeaderCommit → commitIndex
+  L->>A: lastApplied++ 
+  F->>A: lastApplied++
+  A->>T: applyCh ApplyMsg{index, cmd}
+```
+
+#### 3.4.2 `Start(command)`（Leader 写 log）
+
+- 非 leader → `(-1, term, false)`  
+- Leader → `append LogEntry{currentTerm, command}`，返回 `(index, term, true)`  
+- `go startHeartBeat()` 立即推动复制（不持锁发 RPC）
+
+#### 3.4.3 `AppendEntries`（Follower 复制）
+
+在 term 检查与 `lastRPC` 更新之后：
+
+1. **PrevLog 匹配**：`log[PrevLogIndex].Term == PrevLogTerm`，否则 `Success=false`  
+2. **逐条处理 Entries**（循环末尾必须 `index++`）：  
+   - 同 index 不同 term → 截断 `log[index:]` 再 append  
+   - 同 index 同 term → 跳过（重复 RPC）  
+   - index 超出当前 len → append  
+3. **Follower 提交**：`commitIndex = min(LeaderCommit, len(log)-1)`
+
+#### 3.4.4 `startHeartBeat()`（Leader 复制）
+
+对每个 follower `p`（快照后并发）：
+
+```
+PrevLogIndex = nextIndex[p] - 1
+PrevLogTerm  = log[PrevLogIndex].Term
+Entries      = log[nextIndex[p]:]
+```
+
+- **Success**：`matchIndex[p] = PrevLogIndex + len(Entries)`，`nextIndex[p] = matchIndex[p]+1`，`TryCommit()`  
+- **Failure**（同 term）：`nextIndex[p] = max(1, nextIndex[p]-1)` 回退重试  
+
+**并发：** `nextIndex` 用 `make+copy` 做**深拷贝**快照，避免多 goroutine 无锁读共享 slice；reply 处理只写 `rf.nextIndex[p]`。
+
+#### 3.4.5 `TryCommit()`（Leader 提交）
+
+从 log **末尾向前**扫描，仅考虑 **`log[i].Term == currentTerm`** 的 entry；若多数派 `matchIndex >= i`，则 `commitIndex = i` 并 break。
+
+> 不提交旧 term 的 entry，避免未充分复制的历史 log 被 commit（Figure 2 安全性）。
+
+#### 3.4.6 `applier()` 与 `applyCh`
+
+- `commitIndex`：共识层「可以交付」的上界（Leader 本地 commit 或 Follower 跟 LeaderCommit）。  
+- `lastApplied`：已交给上层的上界。  
+- 循环：`lastApplied++` → 拷贝 `Command` → **Unlock** → `applyCh <- ApplyMsg{CommandValid:true, CommandIndex, Command}`。  
+
+`server.go` 中 `applier(applyCh)` 读 channel，调用 `tester.CheckLogs`；3B 的 `one()` 即等待多数 peer 在同一 index 提交相同 command。
+
+---
+
+### 3.5 锁契约（复习要点）
+
+| 场景 | 规则 |
+|------|------|
+| 读/写 `term`、`log`、`nextIndex` 等 | 持 `mu` |
+| `labrpc.Call()` | **禁止**持锁 |
+| `startElection` / `startHeartBeat` | 普通函数，内部 Lock/Unlock；调用方若已持锁需先 Unlock |
+| 刚当选 leader 在选举 goroutine 里调 `startHeartBeat` | 先 Unlock 再调，避免重入死锁 |
+| `applyCh <-` | Unlock 后再 send |
+
+---
+
+### 3.6 关键源文件
+
+| 文件 | 职责 |
+|------|------|
+| `raft1/raft.go` | 全部 Raft 逻辑（3A/3B） |
+| `raft1/server.go` | 创建 `applyCh`，`applier` 对接 tester |
+| `raftapi/raftapi.go` | `Raft` 接口、`ApplyMsg` 定义 |
+| `labrpc/labrpc.go` | 模拟丢包/延迟的 RPC |
+| `raft1/raft_test.go` | 3A/3B 测试用例 |
+| `main/raft1d.go` | Raft daemon 入口 |
+
+### 3.7 3B 测试一览
+
+| 测试 | 考察点 |
+|------|--------|
+| `TestBasicAgree3B` | 连续 Start，index 1,2,3…，全员 commit |
+| `TestRPCBytes3B` | 按 `nextIndex` 增量发送，勿每次发整段 log |
+| `TestFollowerFailure3B` | 少数派仍可 commit；无 quorum 不 commit |
+| `TestLeaderFailure3B` | 新 leader 继承已提交 log |
+| `TestFailAgree3B` / `TestRejoin3B` | 断连重连、旧 leader 退让 |
+| `TestBackup3B` | follower log 冲突时 nextIndex 回退对齐 |
+| `TestConcurrentStarts3B` | 并发 Start |
+
+---
+
 ## 概念对照表
 
-| 概念 | MapReduce (Lab 1) | KV (Lab 2) |
-|------|-------------------|------------|
-| 协调者 | Coordinator | 无（单 server） |
-| 任务单元 | Map/Reduce Task | RPC：Get/Put |
-| 分区 | `ihash(key) % nReduce` | 每 key 一条记录 |
-| 容错 | 超时重派任务 | RPC 重试 + version CAS |
-| 执行语义 | at-least-once（需幂等 Reduce） | Put at-most-once；不确定时 `ErrMaybe` |
-| 互斥 | 任务状态机（每 task 最终 Completed 一次） | `sync.Mutex` + 条件 Put |
-| 锁 | — | KV 上 CAS 锁 |
+| 概念 | MapReduce (Lab 1) | KV (Lab 2) | Raft (Lab 3) |
+|------|-------------------|------------|--------------|
+| 协调者 | Coordinator | 无（单 server） | **Leader**（动态选举） |
+| 任务单元 | Map/Reduce Task | RPC：Get/Put | **log entry**（`Start` 提议） |
+| 分区 | `ihash(key) % nReduce` | 每 key 一条记录 | 全复制（每 peer 一份 log） |
+| 容错 | 超时重派任务 | RPC 重试 + version CAS | 选举 + log 复制 + commit |
+| 执行语义 | at-least-once（Reduce 需幂等） | Put at-most-once；`ErrMaybe` | **committed** 后 apply，顺序一致 |
+| 互斥 | 任务状态机 | `sync.Mutex` + 条件 Put | **`mu` + 多数派 commit** |
+| 与上层接口 | — | Clerk Get/Put | `Start` / `applyCh` |
 
 ---
 
@@ -436,17 +700,32 @@ flowchart TD
 2. **`Get` 第一个返回值是 value（持有者）**，不是 lockname。
 3. 跑锁测试用 `cd src && make lock1`。
 
+### Raft（Lab 3）
+
+1. **选举超时用 `lastRPC + Since`，不是 Timer**：ticker 只负责短间隔检查；Grant 票 / 收到 AppendEntries 要更新 `lastRPC`。
+2. **`RequestVote` 的 log 比较用 `>=`**：同等 log 必须互投，否则选不出 leader。
+3. **`votedFor` 初始 `-1`**；新 term 要清空；同 term 只允许投一人或重试同一 candidate。
+4. **RPC 禁止持锁**；`startElection`/`startHeartBeat` 在 Call 前 Unlock。
+5. **`AppendEntries` 循环每条 entry 后 `index++`**，否则多条 log 写同一位置。
+6. **`nextIndex` 初始为 1**（dummy 在 0）；回退 `max(1, nextIndex-1)`，避免 `PrevLogIndex=-1` panic。
+7. **`TryCommit` 只提交 `log[i].Term == currentTerm`** 的 entry。
+8. **`copy(dst, src)` 方向**：快照 nextIndex 用 `copy(nextIndex, rf.nextIndex)`，写反会把 nextIndex 清零。
+9. **`applyCh` + `applier`**：`commitIndex` 前进后必须按序 `ApplyMsg`，否则 3B tester 看不到提交。
+10. **深拷贝 nextIndex** 再并发读；reply 里只写 `rf.nextIndex[p]`，避免 `-race`。
+
 ---
 
 ## 后续 Lab 预告
 
-| Lab | 目录 | 与本仓库关系 |
-|-----|------|----------------|
-| Lab 3 | `raft1/` | 复制日志 + 选举 |
-| Lab 4 | `kvraft1/` | 用 Raft 复制 **类似本 Lab 的 KV** |
+| Lab | 目录 | 状态 / 关系 |
+|-----|------|-------------|
+| Lab 3A/3B | `raft1/` | **已完成**：选举 + 日志复制 + applyCh |
+| Lab 3C | `raft1/` | 待做：`persist()` / `readPersist()` 崩溃恢复 |
+| Lab 3D | `raft1/` | 待做：Snapshot 压缩 log |
+| Lab 4 | `kvraft1/` | 用 Raft 复制 **Lab 2 风格 KV**（`Start` + `applyCh` 驱动状态机） |
 | Lab 5 | `shardkv1/` | 分片 + 迁移 |
 
-复习 Lab 2 时建议牢记：**version CAS** 与 **Clerk 重试语义** 会直接延续到 KV Raft。
+复习 Lab 2 时建议牢记：**version CAS** 与 **Clerk 重试语义** 会延续到 KV Raft；复习 Lab 3 时牢记 **`commitIndex` / `lastApplied` 分离** 与 **Leader 复制 + 选举 log 限制**，这是 Lab 4 的基础。
 
 ---
 
@@ -454,8 +733,9 @@ flowchart TD
 
 - 课程主页：<https://pdos.csail.mit.edu/6.5840/>
 - MapReduce 论文：[Google Research](https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/)
+- Raft 论文：[In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf)
 - 本仓库基于课程公开 skeleton，实现与注释为个人学习记录。
 
 ---
 
-*文档随 Lab 进度更新；当前覆盖至 Lab 2（含 lock + unreliable Clerk）.*
+*文档随 Lab 进度更新；当前覆盖至 Lab 2（含 lock + unreliable Clerk）与 Lab 3 Raft 3A/3B。*
