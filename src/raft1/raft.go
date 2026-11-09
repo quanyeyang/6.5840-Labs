@@ -456,12 +456,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// 比我更大，我先把自己的Term调整和伟大的leader一样
-	if args.Term >= rf.currentTerm {
-		rf.currentState = follower
+	// 更高任期需要清空旧投票，并在日志检查可能提前返回前持久化
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.lastRPC = time.Now() // 本次我确实被成功压制了
+		rf.votedFor = -1
+		rf.persist()
 	}
+	rf.currentState = follower
+	rf.lastRPC = time.Now() // 同任期或更高任期的 leader 都会重置选举计时
 
 	reply.Term = rf.currentTerm
 
